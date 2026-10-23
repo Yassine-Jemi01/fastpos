@@ -1,103 +1,106 @@
-# FastPOS Core 0.1.2
+# FastPOS OS
 
-**License:** GNU GPL v3.0 only.
+**FastPOS OS is an experimental, Debian-based Linux distribution for point-of-sale (POS) and cashier systems.**
 
-The first Rust component of **FastPOS OS**: an offline-first sales and inventory core. This is a development foundation, not yet a complete point-of-sale application or installable operating system.
+The project is in the **alpha stage**. It is being developed and tested, and it is not ready for use as the primary system in a real shop.
 
-## Design goals
+- **Current release:** [FastPOS OS 0.2.4-alpha](https://github.com/Yassine-Jemi01/fastpos/releases/tag/0.2.4-alpha)
+- **Target architecture:** x86_64 / AMD64
+- **License:** GNU GPL v3.0 only
 
-- Rust business logic kept independent from the future graphical interface.
-- SQLite for local storage; no internet connection or database server required.
-- SQL transactions for checkout so a failed sale does not leave a partial invoice or partially changed stock.
-- Integer arithmetic for money and quantities; no floating-point prices.
-- Country-based currency setup using ISO 3166-1 country codes and ISO 4217 currency metadata.
-- A stock-movement audit trail for opening stock, adjustments, and sales.
-- Tests for successful sales, fractional quantities, discounts, payment validation, duplicate barcodes, stock protection, currency metadata, and schema migration.
+## What is FastPOS OS?
 
-## Requirements
+FastPOS OS is designed to provide a lightweight Linux environment for cashier workflows. The current alpha includes a graphical cashier application and a product catalogue. The project also includes a Rust-based sales and inventory core that uses SQLite for local storage.
 
-- Rust and Cargo (stable toolchain)
-- A C build toolchain may be needed by `rusqlite`'s bundled SQLite build on some systems.
+This is an early testing release. Features and behavior can change between releases.
 
-## Build and test
+## Current alpha
+
+### Available for testing
+
+- Bootable Debian-based AMD64 system image.
+- Graphical cashier application.
+- Product catalogue with manual product entry.
+- Barcode-oriented product lookup workflow.
+- Rust and SQLite core for products, sales, stock, and payment records.
+
+### Limitations and known gaps
+
+- Receipt printing has not been completed and verified for supported receipt printers.
+- Data persistence across a full operating-system reboot has not been verified. In a live USB session, changes may be lost when the computer shuts down or restarts.
+- Backup and restore workflows are not yet documented as production-ready.
+- Tax and fiscal receipt requirements, returns/refunds, customer and supplier management, and other store workflows still need development and testing.
+- Hardware compatibility has not been validated across a wide range of computers, scanners, and printers.
+
+**Do not rely on this alpha release for real business records or daily store operations.** Use a virtual machine or spare computer, and do not store important data on it.
+
+## Download
+
+Open the [FastPOS OS 0.2.4-alpha release page](https://github.com/Yassine-Jemi01/fastpos/releases/tag/0.2.4-alpha) and download the ISO image and its `SHA256SUMS` file from the release assets.
+
+If the ISO asset is not listed on the release page yet, it has not finished uploading and is not available to download.
+
+## Verify the download
+
+Place the downloaded ISO and `SHA256SUMS` file in the same directory, then run:
+
+```sh
+sha256sum --check SHA256SUMS
+```
+
+The result should report `OK` for the ISO. If the check fails, do not use that download; download the files again and verify them.
+
+## Try FastPOS OS
+
+1. Download the ISO from the release page.
+2. Verify it using the checksum instructions above.
+3. Write the ISO to a USB drive using an image-writing tool. Writing an image erases the selected drive, so confirm the target device carefully.
+4. Boot a compatible x86_64/AMD64 computer from the USB drive, or test the image in a virtual machine.
+5. Try the cashier application and manually add a few test products.
+
+**Live-session warning:** Do not assume products or sales will remain after reboot. Reliable persistence must be confirmed for the exact installation mode before entering any data you need to keep.
+
+## Repository contents
+
+The default branch currently contains the FastPOS Rust core:
+
+- `src/` — core library and development CLI.
+- `tests/` — integration tests for checkout, inventory, currency, and database behavior.
+- `examples/` — a small example of using the core.
+- `Cargo.toml` and `Cargo.lock` — Rust package metadata and dependencies.
+
+The bootable ISO is distributed separately through GitHub Releases. The full OS image-build configuration and graphical application source are not yet included in this repository's default branch.
+
+## Develop and test the core
+
+Requirements: a stable Rust toolchain and Cargo. A C build toolchain may be needed when building the bundled SQLite dependency.
+
+Run the core test suite:
 
 ```sh
 cargo test
+```
+
+Build the Rust core:
+
+```sh
 cargo build --release
 ```
 
-## Quick start: development CLI
+The development CLI is intended for testing the core and is not the graphical cashier interface.
 
-The initial CLI is for testing the core before a GUI exists. It uses integer storage units to avoid ambiguous decimal parsing.
+## Data model and implementation notes
 
-```sh
-# Create/open a database. Defaults to Tunisia (TN / TND, scale 1,000).
-cargo run -- init fastpos.sqlite3
+The core uses SQLite and stores money and quantities as integers to avoid floating-point arithmetic for financial calculations. Its database includes product records, sales, sale items, payments, store settings, and stock movements. Checkout operations are designed to update sales and stock transactionally.
 
-# Or choose the store country before adding products or sales.
-# Examples: TN = Tunisia/TND, US = United States/USD, FR = France/EUR, JP = Japan/JPY.
-cargo run -- init store-us.sqlite3 US
-
-# On an empty database, you can change the country later:
-cargo run -- set-country store-us.sqlite3 FR
-
-# Or choose a currency code directly if you do not want to select a country:
-cargo run -- set-currency store-us.sqlite3 EUR
-
-# Inspect the current country/currency setup.
-cargo run -- currency store-us.sqlite3
-
-# Add a product: name, barcode (or -), price in minor units, stock in thousandths.
-# 2.500 TND = 2500; 5 items = 5000.
-cargo run -- add-product fastpos.sqlite3 "Milk" 61100001 2500 5000
-
-# List products.
-cargo run -- products fastpos.sqlite3
-
-# Sell 2 units of product #1, with 6.000 TND cash received.
-# Quantity 2 = 2000; cash 6.000 TND = 6000.
-cargo run -- sell fastpos.sqlite3 1 2000 6000
-
-# Print an existing receipt by sale ID.
-cargo run -- sale fastpos.sqlite3 1
-
-# Sales summary by UTC day.
-cargo run -- day fastpos.sqlite3 2026-10-22
-```
-
-Product IDs and sale IDs are generated by the database; use the IDs printed by the CLI rather than assuming they start at one in an existing database.
-
-You can also run the library example:
-
-```sh
-cargo run --example quick_start
-```
-
-It creates `fastpos-demo.sqlite3` in the current directory and sells two demo units. Run it only in a directory where creating that demo database is acceptable.
-
-## Storage units
-
-- **Money:** integer minor units. The default is TND with `currency_scale = 1000`, so 2.500 TND is stored as 2,500. Use `Database::set_country("TN")` (or the CLI `init <database> TN`) to choose by country, or `Database::set_currency_code("USD")` to choose a code directly. Currency is locked after the first product or sale to prevent interpreting old prices in a different currency.
-- **Quantity:** integer thousandths of a unit, so 1.250 units is stored as 1,250. This supports measured goods such as weight-based products without float arithmetic.
-- `sales.sold_at` and `created_at` timestamps are stored in UTC. `sales_summary_for_utc_day` uses an indexed half-open range (`start <= sold_at < end`). For a store-local business day, convert the local start and next-day start to canonical UTC timestamps and call `sales_summary_for_utc_range`; this also handles daylight-saving days that are not 24 hours long.
-
-## Current limitations
-
-- No GUI yet; the next step is to evaluate GTK 4 / Qt bindings and design the cashier workflow.
-- No tax/VAT configuration, fiscal invoice format, refunds, customer accounts, supplier management, multi-register synchronization, or printer integration yet. These must be designed and tested for the target country before real commercial use.
-- A sale currently requires full payment. A single cash payment may exceed the total and produces change; split or non-cash payments must match the total exactly.
-- Schema version 2 migrates version 1 databases by adding the optional country code in the same transaction as the schema-version update. Legacy currencies are preserved and the country remains unset when it cannot be reliably inferred. Back up data before testing schema changes.
-- The CLI's `day` command reports UTC dates. A production store closing report should use an explicitly configured local time zone and business-day boundary.
-
-## Database tables
-
-- `products`: current product data and stock count.
-- `sales`: receipt totals and currency snapshot.
-- `sale_items`: immutable product name, barcode, price, quantity, and line-total snapshots.
-- `payments`: tendered and applied amount per method.
-- `stock_movements`: opening stock, stock adjustments, and sale deductions.
-- `store_settings`: store country and currency settings (country is optional for manually selected currencies).
+The core's default currency configuration is Tunisia (TND). Currency and country settings should be configured before adding products or sales.
 
 ## Project status
 
-**0.1.2 — timestamp validation bugfix.** This is not a production-ready POS yet. Validate the core first; then add product editing, refunds/returns, country-specific tax policy, receipt formatting, and a GTK 4 UI before packaging the Debian-based FastPOS OS image.
+FastPOS OS is under active development. The current priority is improving data reliability, receipt printing, backups, hardware support, and the overall cashier workflow before considering production use.
+
+Bug reports and constructive feedback are welcome through [GitHub Issues](https://github.com/Yassine-Jemi01/fastpos/issues).
+
+---
+
+FastPOS OS is provided under the terms of the GNU General Public License v3.0 only. See [LICENSE](LICENSE).
