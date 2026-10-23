@@ -184,7 +184,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let db = Database::open(&args[1])?;
             let day = db.sales_summary_for_utc_day(&args[2])?;
             let (currency, scale) = db.currency()?;
-            println!("Sales summary for {} (UTC)", day.day_utc);
+            println!("Sales summary for {} (UTC)", args[2]);
             println!("  Number of sales: {}", day.sale_count);
             println!(
                 "  Subtotal: {} {}",
@@ -239,7 +239,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 }
 
 fn print_help() {
-    println!("FastPOS Core 0.1.0 — development CLI\n");
+    println!("FastPOS Core 0.1.1 — development CLI\n");
     println!("Commands:");
     println!("  fastpos init <database-file> [country-code]");
     println!("  fastpos set-country <database-file> <country-code>");

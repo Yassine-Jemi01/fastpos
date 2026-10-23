@@ -1,4 +1,4 @@
-# FastPOS Core 0.1.0
+# FastPOS Core 0.1.2
 
 **License:** GNU GPL v3.0 only.
 
@@ -12,7 +12,7 @@ The first Rust component of **FastPOS OS**: an offline-first sales and inventory
 - Integer arithmetic for money and quantities; no floating-point prices.
 - Country-based currency setup using ISO 3166-1 country codes and ISO 4217 currency metadata.
 - A stock-movement audit trail for opening stock, adjustments, and sales.
-- Tests for successful sales, fractional quantities, discounts, payment validation, duplicate barcodes, and stock protection.
+- Tests for successful sales, fractional quantities, discounts, payment validation, duplicate barcodes, stock protection, currency metadata, and schema migration.
 
 ## Requirements
 
@@ -79,14 +79,14 @@ It creates `fastpos-demo.sqlite3` in the current directory and sells two demo un
 
 - **Money:** integer minor units. The default is TND with `currency_scale = 1000`, so 2.500 TND is stored as 2,500. Use `Database::set_country("TN")` (or the CLI `init <database> TN`) to choose by country, or `Database::set_currency_code("USD")` to choose a code directly. Currency is locked after the first product or sale to prevent interpreting old prices in a different currency.
 - **Quantity:** integer thousandths of a unit, so 1.250 units is stored as 1,250. This supports measured goods such as weight-based products without float arithmetic.
-- `sales.sold_at` and `created_at` timestamps are stored in UTC. `sales_summary_for_utc_day` intentionally summarizes a UTC date, not the store's local business day.
+- `sales.sold_at` and `created_at` timestamps are stored in UTC. `sales_summary_for_utc_day` uses an indexed half-open range (`start <= sold_at < end`). For a store-local business day, convert the local start and next-day start to canonical UTC timestamps and call `sales_summary_for_utc_range`; this also handles daylight-saving days that are not 24 hours long.
 
 ## Current limitations
 
 - No GUI yet; the next step is to evaluate GTK 4 / Qt bindings and design the cashier workflow.
 - No tax/VAT configuration, fiscal invoice format, refunds, customer accounts, supplier management, multi-register synchronization, or printer integration yet. These must be designed and tested for the target country before real commercial use.
 - A sale currently requires full payment. A single cash payment may exceed the total and produces change; split or non-cash payments must match the total exactly.
-- Schema version 2 migrates version 1 databases by adding the optional country code. Back up data before testing schema changes.
+- Schema version 2 migrates version 1 databases by adding the optional country code in the same transaction as the schema-version update. Legacy currencies are preserved and the country remains unset when it cannot be reliably inferred. Back up data before testing schema changes.
 - The CLI's `day` command reports UTC dates. A production store closing report should use an explicitly configured local time zone and business-day boundary.
 
 ## Database tables
@@ -100,4 +100,4 @@ It creates `fastpos-demo.sqlite3` in the current directory and sells two demo un
 
 ## Project status
 
-**0.1.0 — core prototype.** This is not a production-ready POS yet. Validate the core first; then add product editing, refunds/returns, country-specific tax policy, receipt formatting, and a GTK 4 UI before packaging the Debian-based FastPOS OS image.
+**0.1.2 — timestamp validation bugfix.** This is not a production-ready POS yet. Validate the core first; then add product editing, refunds/returns, country-specific tax policy, receipt formatting, and a GTK 4 UI before packaging the Debian-based FastPOS OS image.

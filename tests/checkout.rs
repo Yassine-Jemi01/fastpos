@@ -51,6 +51,69 @@ fn sale_is_saved_and_stock_is_reduced_atomically() {
 }
 
 #[test]
+fn utc_summary_uses_inclusive_start_and_exclusive_end() {
+    let mut db = Database::open_in_memory().unwrap();
+    let p = db
+        .add_product(product("Water", "61100090", 1_000, 3_000))
+        .unwrap();
+    let receipt = db
+        .checkout(CheckoutRequest {
+            items: vec![CartItem {
+                product_id: p.id,
+                quantity_milli: 1_000,
+            }],
+            discount_minor: 0,
+            payments: vec![cash_payment(1_000)],
+        })
+        .unwrap();
+
+    let after_sale = db
+        .sales_summary_for_utc_range(&receipt.sold_at, "9999-12-31T23:59:59.999Z")
+        .unwrap();
+    assert_eq!(
+        after_sale.sale_count, 1,
+        "range includes its start boundary"
+    );
+
+    let before_sale = db
+        .sales_summary_for_utc_range("0001-01-01T00:00:00.000Z", &receipt.sold_at)
+        .unwrap();
+    assert_eq!(before_sale.sale_count, 0, "range excludes its end boundary");
+
+    let utc_day = db
+        .sales_summary_for_utc_day(&receipt.sold_at[..10])
+        .unwrap();
+    assert_eq!(utc_day.sale_count, 1);
+    assert!(db
+        .sales_summary_for_utc_range(&receipt.sold_at, &receipt.sold_at)
+        .is_err());
+}
+
+#[test]
+fn partially_applied_legacy_migration_recovers_without_mismatched_country() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partially-migrated.sqlite3");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 1;
+             CREATE TABLE store_settings (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 country_code TEXT CHECK (country_code IS NULL OR length(country_code) = 2) DEFAULT 'TN',
+                 currency_code TEXT NOT NULL CHECK (length(currency_code) = 3),
+                 currency_scale INTEGER NOT NULL CHECK (currency_scale IN (1, 10, 100, 1000, 10000)),
+                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             );
+             INSERT INTO store_settings (id, country_code, currency_code, currency_scale) VALUES (1, 'TN', 'EUR', 100);",
+        ).unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.country().unwrap(), None);
+    assert_eq!(db.currency().unwrap(), ("EUR".to_string(), 100));
+}
+
+#[test]
 fn fractional_quantity_is_rounded_using_integer_arithmetic() {
     let mut db = Database::open_in_memory().unwrap();
     let p = db
@@ -196,7 +259,7 @@ fn schema_v1_database_is_migrated_without_losing_data() {
                  currency_scale INTEGER NOT NULL CHECK (currency_scale IN (1, 10, 100, 1000, 10000)),
                  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
              );
-             INSERT INTO store_settings (id, currency_code, currency_scale) VALUES (1, 'TND', 1000);
+             INSERT INTO store_settings (id, currency_code, currency_scale) VALUES (1, 'EUR', 100);
              CREATE TABLE products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, barcode TEXT UNIQUE, unit_price_minor INTEGER NOT NULL, stock_quantity_milli INTEGER NOT NULL DEFAULT 0, is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')));
              CREATE TABLE sales (id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_number TEXT UNIQUE, currency_code TEXT NOT NULL, currency_scale INTEGER NOT NULL, subtotal_minor INTEGER NOT NULL, discount_minor INTEGER NOT NULL, total_minor INTEGER NOT NULL, change_due_minor INTEGER NOT NULL DEFAULT 0, sold_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')));
              INSERT INTO products (name, barcode, unit_price_minor, stock_quantity_milli) VALUES ('Milk', '61100001', 2500, 5000);",
@@ -204,7 +267,7 @@ fn schema_v1_database_is_migrated_without_losing_data() {
     }
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.country().unwrap().as_deref(), Some("TN"));
-    assert_eq!(db.currency().unwrap(), ("TND".to_string(), 1000));
+    assert_eq!(db.country().unwrap(), None);
+    assert_eq!(db.currency().unwrap(), ("EUR".to_string(), 100));
     assert_eq!(db.list_products().unwrap().len(), 1);
 }

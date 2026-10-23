@@ -260,7 +260,10 @@ pub struct Receipt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SalesSummary {
-    pub day_utc: String,
+    /// Inclusive beginning of the summary period, in canonical UTC format.
+    pub period_start_utc: String,
+    /// Exclusive end of the summary period, in canonical UTC format.
+    pub period_end_utc: String,
     pub sale_count: i64,
     pub subtotal_minor: i64,
     pub discount_minor: i64,
@@ -286,27 +289,48 @@ impl Database {
     }
 
     fn initialize(conn: Connection) -> FastPosResult<Self> {
+        let mut conn = conn;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")?;
         // WAL improves recovery and concurrent read behavior for file databases.
         // SQLite may report "memory" instead for an in-memory database.
         let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
 
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        // Serialize initialization and make schema changes plus user_version one
+        // atomic operation. A crash cannot leave a half-applied migration.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(FastPosError::InvalidInput(format!(
                 "database schema version {version} is newer than this FastPOS Core supports ({SCHEMA_VERSION})"
             )));
         }
-        // Version 1 databases already contain store_settings, but did not record
-        // the selected country. Preserve existing products/sales and migrate in place.
+
         if version == 1 {
-            conn.execute_batch(
-                "ALTER TABLE store_settings ADD COLUMN country_code TEXT CHECK (country_code IS NULL OR length(country_code) = 2) DEFAULT 'TN';",
+            // Recover if an older pre-release added this column but crashed
+            // before updating user_version.
+            let has_country_code: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('store_settings') WHERE name = 'country_code')",
+                [],
+                |row| row.get(0),
             )?;
+            if !has_country_code {
+                // NULL preserves legacy currencies without falsely assigning TN.
+                tx.execute_batch(
+                    "ALTER TABLE store_settings ADD COLUMN country_code TEXT CHECK (country_code IS NULL OR length(country_code) = 2);",
+                )?;
+            }
         }
-        conn.execute_batch(SCHEMA)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+
+        tx.execute_batch(SCHEMA)?;
+        // Repair any database touched by the old migration, including ones
+        // already marked v2, which assigned TN despite a non-TND currency.
+        tx.execute(
+            "UPDATE store_settings SET country_code = NULL WHERE country_code = 'TN' AND currency_code <> 'TND'",
+            [],
+        )?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
         Ok(Self { conn })
     }
 
@@ -374,10 +398,27 @@ impl Database {
         self.set_currency_internal(currency.code(), scale, None)
     }
 
-    /// Configure the store currency before creating products or sales.
-    /// `scale` must be a power of ten from 1 through 10,000.
+    /// Configure an ISO 4217 currency before creating products or sales.
+    /// The scale must match the ISO minor-unit exponent for that currency.
     pub fn set_currency(&mut self, code: &str, scale: i64) -> FastPosResult<()> {
-        self.set_currency_internal(code, scale, None)
+        let normalized = code.trim().to_ascii_uppercase();
+        let currency = iso_currency::Currency::from_code(&normalized).ok_or_else(|| {
+            FastPosError::InvalidInput(format!("unknown ISO 4217 currency code {normalized:?}"))
+        })?;
+        let exponent = currency.exponent().ok_or_else(|| {
+            FastPosError::InvalidInput(format!(
+                "currency {} has no supported minor-unit exponent",
+                currency.code()
+            ))
+        })?;
+        let expected_scale = scale_for_currency_exponent(exponent)?;
+        if scale != expected_scale {
+            return Err(FastPosError::InvalidInput(format!(
+                "currency {} requires scale {expected_scale}, not {scale}",
+                currency.code()
+            )));
+        }
+        self.set_currency_internal(currency.code(), scale, None)
     }
 
     fn set_currency_internal(
@@ -756,113 +797,139 @@ impl Database {
                 params![sale_id, payment.method, payment.tendered_minor, payment.applied_minor],
             )?;
         }
+        // Read the receipt before commit so a post-commit query failure cannot
+        // surface as a failed sale and cause callers to retry a sale already saved.
+        let receipt = read_sale(&tx, sale_id)?;
         tx.commit()?;
-        self.get_sale(sale_id)
+        Ok(receipt)
     }
 
     pub fn get_sale(&self, sale_id: i64) -> FastPosResult<Receipt> {
-        let base = self
-            .conn
-            .query_row(
-                "SELECT id, receipt_number, sold_at, currency_code, currency_scale, subtotal_minor, discount_minor, total_minor, change_due_minor FROM sales WHERE id = ?1",
-                [sale_id],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, i64>(7)?,
-                        row.get::<_, i64>(8)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or_else(|| FastPosError::NotFound(format!("sale {sale_id}")))?;
-
-        let (
-            id,
-            receipt_number,
-            sold_at,
-            currency_code,
-            currency_scale,
-            subtotal_minor,
-            discount_minor,
-            total_minor,
-            change_due_minor,
-        ) = base;
-        let mut item_statement = self.conn.prepare(
-            "SELECT product_id, product_name, barcode, unit_price_minor, quantity_milli, line_total_minor FROM sale_items WHERE sale_id = ?1 ORDER BY id ASC",
-        )?;
-        let item_rows = item_statement.query_map([sale_id], |row| {
-            Ok(SaleItem {
-                product_id: row.get(0)?,
-                product_name: row.get(1)?,
-                barcode: row.get(2)?,
-                unit_price_minor: row.get(3)?,
-                quantity_milli: row.get(4)?,
-                line_total_minor: row.get(5)?,
-            })
-        })?;
-        let mut items = Vec::new();
-        for row in item_rows {
-            items.push(row?);
-        }
-        drop(item_statement);
-
-        let mut payment_statement = self.conn.prepare(
-            "SELECT method, tendered_minor, applied_minor FROM payments WHERE sale_id = ?1 ORDER BY id ASC",
-        )?;
-        let payment_rows = payment_statement.query_map([sale_id], |row| {
-            Ok(PaymentRecord {
-                method: row.get(0)?,
-                tendered_minor: row.get(1)?,
-                applied_minor: row.get(2)?,
-            })
-        })?;
-        let mut payments = Vec::new();
-        for row in payment_rows {
-            payments.push(row?);
-        }
-
-        let receipt_number = receipt_number.ok_or_else(|| {
-            FastPosError::InvalidInput(format!("sale {sale_id} has no receipt number"))
-        })?;
-        Ok(Receipt {
-            id,
-            receipt_number,
-            sold_at,
-            currency_code,
-            currency_scale,
-            subtotal_minor,
-            discount_minor,
-            total_minor,
-            change_due_minor,
-            items,
-            payments,
-        })
+        read_sale(&self.conn, sale_id)
     }
 
-    /// Return totals for a UTC calendar day (`YYYY-MM-DD`). SQLite timestamps
-    /// are stored in UTC so this function deliberately uses UTC, not local time.
+    /// Return totals for a UTC calendar day (`YYYY-MM-DD`).
     pub fn sales_summary_for_utc_day(&self, day: &str) -> FastPosResult<SalesSummary> {
-        validate_date_shape(day)?;
+        let next_day = next_utc_day(day)?;
+        let start = format!("{day}T00:00:00.000Z");
+        let end = format!("{next_day}T00:00:00.000Z");
+        self.sales_summary_for_utc_range(&start, &end)
+    }
+
+    /// Summarize sales in `[start_utc, end_utc)` using canonical UTC timestamps
+    /// (`YYYY-MM-DDTHH:MM:SS.sssZ`). The UI can convert local business-day
+    /// boundaries to UTC and call this method, including for DST transition days.
+    pub fn sales_summary_for_utc_range(
+        &self,
+        start_utc: &str,
+        end_utc: &str,
+    ) -> FastPosResult<SalesSummary> {
+        validate_utc_timestamp(start_utc)?;
+        validate_utc_timestamp(end_utc)?;
+        if start_utc >= end_utc {
+            return Err(FastPosError::InvalidInput(
+                "summary range start must be earlier than its exclusive end".into(),
+            ));
+        }
         let (sale_count, subtotal_minor, discount_minor, net_total_minor) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(subtotal_minor), 0), COALESCE(SUM(discount_minor), 0), COALESCE(SUM(total_minor), 0) FROM sales WHERE substr(sold_at, 1, 10) = ?1",
-            [day],
+            "SELECT COUNT(*), COALESCE(SUM(subtotal_minor), 0), COALESCE(SUM(discount_minor), 0), COALESCE(SUM(total_minor), 0) FROM sales WHERE sold_at >= ?1 AND sold_at < ?2",
+            params![start_utc, end_utc],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         Ok(SalesSummary {
-            day_utc: day.to_string(),
+            period_start_utc: start_utc.to_string(),
+            period_end_utc: end_utc.to_string(),
             sale_count,
             subtotal_minor,
             discount_minor,
             net_total_minor,
         })
     }
+}
+
+fn read_sale(conn: &Connection, sale_id: i64) -> FastPosResult<Receipt> {
+    let base = conn
+        .query_row(
+            "SELECT id, receipt_number, sold_at, currency_code, currency_scale, subtotal_minor, discount_minor, total_minor, change_due_minor FROM sales WHERE id = ?1",
+            [sale_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| FastPosError::NotFound(format!("sale {sale_id}")))?;
+
+    let (
+        id,
+        receipt_number,
+        sold_at,
+        currency_code,
+        currency_scale,
+        subtotal_minor,
+        discount_minor,
+        total_minor,
+        change_due_minor,
+    ) = base;
+    let mut item_statement = conn.prepare(
+        "SELECT product_id, product_name, barcode, unit_price_minor, quantity_milli, line_total_minor FROM sale_items WHERE sale_id = ?1 ORDER BY id ASC",
+    )?;
+    let item_rows = item_statement.query_map([sale_id], |row| {
+        Ok(SaleItem {
+            product_id: row.get(0)?,
+            product_name: row.get(1)?,
+            barcode: row.get(2)?,
+            unit_price_minor: row.get(3)?,
+            quantity_milli: row.get(4)?,
+            line_total_minor: row.get(5)?,
+        })
+    })?;
+    let mut items = Vec::new();
+    for row in item_rows {
+        items.push(row?);
+    }
+    drop(item_statement);
+
+    let mut payment_statement = conn.prepare(
+        "SELECT method, tendered_minor, applied_minor FROM payments WHERE sale_id = ?1 ORDER BY id ASC",
+    )?;
+    let payment_rows = payment_statement.query_map([sale_id], |row| {
+        Ok(PaymentRecord {
+            method: row.get(0)?,
+            tendered_minor: row.get(1)?,
+            applied_minor: row.get(2)?,
+        })
+    })?;
+    let mut payments = Vec::new();
+    for row in payment_rows {
+        payments.push(row?);
+    }
+
+    let receipt_number = receipt_number.ok_or_else(|| {
+        FastPosError::InvalidInput(format!("sale {sale_id} has no receipt number"))
+    })?;
+    Ok(Receipt {
+        id,
+        receipt_number,
+        sold_at,
+        currency_code,
+        currency_scale,
+        subtotal_minor,
+        discount_minor,
+        total_minor,
+        change_due_minor,
+        items,
+        payments,
+    })
 }
 
 fn row_to_product(row: &Row<'_>) -> rusqlite::Result<Product> {
@@ -918,6 +985,79 @@ fn validate_date_shape(day: &str) -> FastPosResult<()> {
     {
         return Err(FastPosError::InvalidInput(
             "date must use YYYY-MM-DD format (UTC)".into(),
+        ));
+    }
+    let year = day[0..4].parse::<u32>().unwrap_or(0);
+    let month = day[5..7].parse::<u32>().unwrap_or(0);
+    let date = day[8..10].parse::<u32>().unwrap_or(0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    };
+    if year == 0 || date == 0 || date > days_in_month {
+        return Err(FastPosError::InvalidInput(
+            "date must be a real Gregorian date in YYYY-MM-DD format".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn next_utc_day(day: &str) -> FastPosResult<String> {
+    validate_date_shape(day)?;
+    let mut year = day[0..4].parse::<u32>().unwrap();
+    let mut month = day[5..7].parse::<u32>().unwrap();
+    let mut date = day[8..10].parse::<u32>().unwrap();
+    let last_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => unreachable!("validate_date_shape rejects invalid months"),
+    };
+    if date < last_day {
+        date += 1;
+    } else if month < 12 {
+        date = 1;
+        month += 1;
+    } else {
+        if year == 9999 {
+            return Err(FastPosError::InvalidInput(
+                "date is too late to calculate the next day".into(),
+            ));
+        }
+        date = 1;
+        month = 1;
+        year += 1;
+    }
+    Ok(format!("{year:04}-{month:02}-{date:02}"))
+}
+
+fn validate_utc_timestamp(timestamp: &str) -> FastPosResult<()> {
+    let bytes = timestamp.as_bytes();
+    if bytes.len() != 24
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'.'
+        || bytes[23] != b'Z'
+        || !bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19 | 23) || byte.is_ascii_digit()
+        })
+    {
+        return Err(FastPosError::InvalidInput(
+            "timestamp must use canonical UTC format YYYY-MM-DDTHH:MM:SS.sssZ".into(),
+        ));
+    }
+    validate_date_shape(&timestamp[0..10])?;
+    let hour = timestamp[11..13].parse::<u32>().unwrap_or(99);
+    let minute = timestamp[14..16].parse::<u32>().unwrap_or(99);
+    let second = timestamp[17..19].parse::<u32>().unwrap_or(99);
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err(FastPosError::InvalidInput(
+            "timestamp contains an invalid time".into(),
         ));
     }
     Ok(())
@@ -996,6 +1136,32 @@ mod unit_tests {
             db.set_country("TUN"),
             Err(FastPosError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn manual_currency_scale_must_match_iso_metadata() {
+        let mut db = Database::open_in_memory().unwrap();
+        assert!(matches!(
+            db.set_currency("ABC", 100),
+            Err(FastPosError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            db.set_currency("TND", 100),
+            Err(FastPosError::InvalidInput(_))
+        ));
+        db.set_currency("USD", 100).unwrap();
+        assert_eq!(db.currency().unwrap(), ("USD".to_string(), 100));
+    }
+
+    #[test]
+    fn utc_date_validation_handles_calendar_boundaries() {
+        assert_eq!(next_utc_day("2024-02-28").unwrap(), "2024-02-29");
+        assert_eq!(next_utc_day("2026-02-28").unwrap(), "2026-03-01");
+        assert_eq!(next_utc_day("2026-12-31").unwrap(), "2027-01-01");
+        assert!(next_utc_day("2026-02-29").is_err());
+        assert!(validate_utc_timestamp("2026-10-23T09:15:30.123Z").is_ok());
+        assert!(validate_utc_timestamp("2026-10-23T24:00:00.000Z").is_err());
+        assert!(validate_utc_timestamp("2026/10/23T09:15:30.123Z").is_err());
     }
 
     #[test]

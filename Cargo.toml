@@ -1,6 +1,6 @@
 [package]
 name = "fastpos-core"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "Offline-first sales and inventory core for FastPOS OS"
 license = "GPL-3.0-only"
